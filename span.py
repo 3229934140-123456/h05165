@@ -1,5 +1,6 @@
 import time
 import uuid
+import threading
 from typing import Optional, Dict, Any, List
 from context_propagation import TraceContext, ContextManager
 
@@ -135,13 +136,24 @@ class Tracer:
     """
     Tracer 是 span 的工厂和管理器。
     负责创建 span、管理活动 span 栈、以及将完成的 span 发送给收集器。
+
+    线程安全设计：
+    - 活动 span 栈存储在线程本地 (_thread_local)
+    - 上下文通过 ContextManager (threading.local) 传递
+    - 每个线程处理自己的请求，互不干扰
     """
 
     def __init__(self, service_name: str, collector=None, sampler=None):
         self.service_name = service_name
         self.collector = collector
         self.sampler = sampler
-        self._active_spans: List[Span] = []
+        self._thread_local = threading.local()
+
+    def _get_active_spans(self) -> List[Span]:
+        """获取当前线程的活动 span 栈。"""
+        if not hasattr(self._thread_local, "active_spans"):
+            self._thread_local.active_spans = []
+        return self._thread_local.active_spans
 
     def start_span(
         self,
@@ -155,9 +167,13 @@ class Tracer:
 
         优先级：
         1. 显式指定的 parent span
-        2. 显式指定的 context
+        2. 显式指定的 context（下游服务继承，只传递不重采样）
         3. 当前线程的活动上下文
-        4. 创建新的根上下文
+        4. 创建新的根上下文（入口服务，使用确定性采样）
+
+        采样策略：
+        - 入口服务（无上下文时）：先生成 trace_id，再基于 trace_id 哈希做确定性采样
+        - 下游服务（有上下文时）：直接继承 x-sampled 头部，绝不重新采样
         """
         if context is None and parent is not None:
             context = parent.context.new_child()
@@ -168,10 +184,20 @@ class Tracer:
             if current_context is not None:
                 context = current_context.new_child()
             else:
+                trace_id = TraceContext.generate_trace_id()
                 sampled = True
                 if self.sampler is not None:
-                    sampled = self.sampler.should_sample()
-                context = TraceContext.new_root(sampled=sampled)
+                    if hasattr(self.sampler, "should_sample_by_trace_id"):
+                        sampled = self.sampler.should_sample_by_trace_id(trace_id)
+                    else:
+                        sampled = self.sampler.should_sample()
+                span_id = TraceContext.generate_span_id()
+                context = TraceContext(
+                    trace_id=trace_id,
+                    span_id=span_id,
+                    parent_span_id=None,
+                    sampled=sampled,
+                )
 
         parent_span_id = None
         if parent is not None:
@@ -187,7 +213,8 @@ class Tracer:
             service_name=self.service_name,
         )
 
-        self._active_spans.append(span)
+        active_spans = self._get_active_spans()
+        active_spans.append(span)
         ContextManager.set_context(context)
 
         return span
@@ -211,16 +238,20 @@ class Tracer:
         if span.context.sampled and self.collector is not None:
             self.collector.collect(span)
 
-        if span in self._active_spans:
-            self._active_spans.remove(span)
+        active_spans = self._get_active_spans()
+        if span in active_spans:
+            active_spans.remove(span)
 
-        if self._active_spans:
-            ContextManager.set_context(self._active_spans[-1].context)
+        if active_spans:
+            ContextManager.set_context(active_spans[-1].context)
         else:
             ContextManager.clear_context()
 
     def extract(self, headers: Dict[str, Any]) -> Optional[TraceContext]:
-        """从 HTTP 头部提取 trace 上下文。"""
+        """
+        从 HTTP 头部提取 trace 上下文。
+        下游服务使用此方法恢复上下文，采样决策直接继承，不重新采样。
+        """
         return TraceContext.from_headers(headers)
 
     def inject(self, context: TraceContext, headers: Dict[str, Any]) -> Dict[str, Any]:
@@ -229,9 +260,10 @@ class Tracer:
         return headers
 
     def get_active_span(self) -> Optional[Span]:
-        """获取当前活动的 span。"""
-        if self._active_spans:
-            return self._active_spans[-1]
+        """获取当前线程的活动 span。"""
+        active_spans = self._get_active_spans()
+        if active_spans:
+            return active_spans[-1]
         return None
 
 

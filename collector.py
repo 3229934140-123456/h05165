@@ -10,43 +10,96 @@ class SpanBuffer:
     """
     Span 缓冲区，用于按 trace ID 分组存储 span。
     处理乱序到达的 span，并检测 trace 是否完整。
+
+    完成策略（更稳健）：
+    1. 检测到所有父子关系都完整（has_root + all_parents_present）时，
+       进入 WAITING_CHILDREN 状态，不立即触发完成通知
+    2. 等待 post_root_idle_time 秒没有新 span 到达，认为链路稳定
+    3. 或外部显式调用 flush_trace 强制完成
+    4. 之后才触发 on_trace_complete 回调
+    5. 完成后若有迟到的子 span，仍可追加并重新触发更新通知
     """
 
-    def __init__(self, trace_id: str):
+    STATE_PENDING = "pending"
+    STATE_WAITING_CHILDREN = "waiting_children"
+    STATE_COMPLETE = "complete"
+
+    def __init__(self, trace_id: str, post_root_idle_time: float = 2.0):
         self.trace_id = trace_id
+        self.post_root_idle_time = post_root_idle_time
         self.spans: Dict[str, Span] = {}
         self.span_ids: Set[str] = set()
         self.parent_span_ids: Set[str] = set()
         self.received_at = time.time()
         self.last_span_at = time.time()
-        self.is_complete = False
+        self.state = self.STATE_PENDING
+        self._all_parents_present = False
+        self._has_root = False
+        self._completed_notified = False
 
     def add_span(self, span: Span) -> None:
         """添加一个 span 到缓冲区。"""
         span_id = span.span_id
-        if span_id in self.spans:
-            return
+        is_new = span_id not in self.spans
 
-        self.spans[span_id] = span
-        self.span_ids.add(span_id)
+        if is_new:
+            self.spans[span_id] = span
+            self.span_ids.add(span_id)
+
         self.last_span_at = time.time()
 
         if span.parent_span_id is not None:
             self.parent_span_ids.add(span.parent_span_id)
 
-        self._check_completeness()
+        self._update_state()
 
-    def _check_completeness(self) -> None:
-        """
-        检查 trace 是否完整。
-        完整的条件：所有 parent_span_id 都存在于 span_ids 中，
-        且存在一个根 span（parent_span_id 为 None）。
-        """
-        has_root = any(span.parent_span_id is None for span in self.spans.values())
-        all_parents_present = self.parent_span_ids.issubset(self.span_ids)
+    def _update_state(self) -> None:
+        """更新 buffer 状态。"""
+        self._has_root = any(
+            s.parent_span_id is None for s in self.spans.values()
+        )
+        self._all_parents_present = self.parent_span_ids.issubset(self.span_ids)
 
-        if has_root and all_parents_present:
-            self.is_complete = True
+        if self.state == self.STATE_PENDING:
+            if self._has_root and self._all_parents_present:
+                self.state = self.STATE_WAITING_CHILDREN
+
+        elif self.state == self.STATE_WAITING_CHILDREN:
+            if not (self._has_root and self._all_parents_present):
+                self.state = self.STATE_PENDING
+
+    def can_complete(self, force_flush: bool = False) -> bool:
+        """
+        判断是否可以触发完成回调。
+
+        :param force_flush: 是否外部强制 flush
+        :return: True 表示可以触发完成回调
+        """
+        if self.state == self.STATE_COMPLETE:
+            return False
+
+        if self.state == self.STATE_PENDING:
+            if force_flush:
+                return True
+            return False
+
+        if self.state == self.STATE_WAITING_CHILDREN:
+            if force_flush:
+                return True
+            if self.get_idle_time() >= self.post_root_idle_time:
+                return True
+            return False
+
+        return False
+
+    def mark_notified(self) -> None:
+        """标记为已通知完成。"""
+        self.state = self.STATE_COMPLETE
+        self._completed_notified = True
+
+    def is_structurally_complete(self) -> bool:
+        """父子结构是否完整（有根且所有父 span 都到了）。"""
+        return self._has_root and self._all_parents_present
 
     def get_missing_span_ids(self) -> Set[str]:
         """获取缺失的 span ID。"""
@@ -68,12 +121,18 @@ class SpanBuffer:
         """获取距离上次接收 span 的时间（秒）。"""
         return time.time() - self.last_span_at
 
+    @property
+    def is_complete(self) -> bool:
+        """兼容旧接口：是否已通知完成。"""
+        return self.state == self.STATE_COMPLETE
+
     def __repr__(self) -> str:
         return (
             f"SpanBuffer(trace_id={self.trace_id}, "
             f"spans={len(self.spans)}, "
-            f"complete={self.is_complete}, "
-            f"age={self.get_age():.1f}s)"
+            f"state={self.state}, "
+            f"structurally_complete={self.is_structurally_complete()}, "
+            f"idle={self.get_idle_time():.1f}s)"
         )
 
 
@@ -85,7 +144,7 @@ class SpanCollector:
     1. 接收服务上报的 span（支持乱序）
     2. 按 trace ID 分组存储
     3. 批量处理 span 提高效率
-    4. 检测 trace 完整性并通知下游
+    4. 稳健的完成检测：根 span 到达后等待子 span，空闲/flush 后才通知
     5. 超时清理防止内存泄漏
     """
 
@@ -96,6 +155,8 @@ class SpanCollector:
         flush_interval: float = 1.0,
         max_trace_age: float = 300.0,
         max_idle_time: float = 60.0,
+        post_root_idle_time: float = 2.0,
+        completion_check_interval: float = 0.5,
         on_trace_complete: Optional[Callable[[str, List[Span]], None]] = None,
     ):
         """
@@ -104,6 +165,8 @@ class SpanCollector:
         :param flush_interval: 强制刷新间隔（秒）
         :param max_trace_age: trace 最大存活时间（秒）
         :param max_idle_time: trace 最大空闲时间（秒）
+        :param post_root_idle_time: 根 span 到达后等待子 span 的空闲时间（秒）
+        :param completion_check_interval: 完成检测线程的检查间隔（秒）
         :param on_trace_complete: trace 完成时的回调函数
         """
         self.max_queue_size = max_queue_size
@@ -111,6 +174,8 @@ class SpanCollector:
         self.flush_interval = flush_interval
         self.max_trace_age = max_trace_age
         self.max_idle_time = max_idle_time
+        self.post_root_idle_time = post_root_idle_time
+        self.completion_check_interval = completion_check_interval
         self.on_trace_complete = on_trace_complete
 
         self._queue: "queue.Queue[Span]" = queue.Queue(maxsize=max_queue_size)
@@ -119,11 +184,13 @@ class SpanCollector:
 
         self._worker_thread: Optional[threading.Thread] = None
         self._cleanup_thread: Optional[threading.Thread] = None
+        self._completion_thread: Optional[threading.Thread] = None
         self._stop_event = threading.Event()
 
         self._collected_spans = 0
         self._completed_traces = 0
         self._dropped_spans = 0
+        self._notified_traces: Set[str] = set()
 
         self._last_flush = time.time()
 
@@ -138,6 +205,12 @@ class SpanCollector:
             self._cleanup_thread = threading.Thread(target=self._cleanup_loop, daemon=True)
             self._cleanup_thread.start()
 
+        if self._completion_thread is None or not self._completion_thread.is_alive():
+            self._completion_thread = threading.Thread(
+                target=self._completion_check_loop, daemon=True
+            )
+            self._completion_thread.start()
+
     def stop(self) -> None:
         """停止收集器。"""
         self._stop_event.set()
@@ -145,6 +218,8 @@ class SpanCollector:
             self._worker_thread.join(timeout=5.0)
         if self._cleanup_thread is not None:
             self._cleanup_thread.join(timeout=5.0)
+        if self._completion_thread is not None:
+            self._completion_thread.join(timeout=5.0)
 
     def collect(self, span: Span) -> bool:
         """
@@ -202,23 +277,51 @@ class SpanCollector:
             for span in batch:
                 trace_id = span.trace_id
                 if trace_id not in self._trace_buffers:
-                    self._trace_buffers[trace_id] = SpanBuffer(trace_id)
+                    self._trace_buffers[trace_id] = SpanBuffer(
+                        trace_id,
+                        post_root_idle_time=self.post_root_idle_time,
+                    )
 
                 buffer = self._trace_buffers[trace_id]
                 buffer.add_span(span)
                 self._collected_spans += 1
 
-                if buffer.is_complete and self.on_trace_complete is not None:
-                    self._notify_trace_complete(trace_id, buffer)
+                if trace_id in self._notified_traces:
+                    self._notify_trace_updated(trace_id, buffer)
 
     def _notify_trace_complete(self, trace_id: str, buffer: SpanBuffer) -> None:
         """通知 trace 完成。"""
         try:
             self._completed_traces += 1
+            self._notified_traces.add(trace_id)
+            buffer.mark_notified()
             if self.on_trace_complete is not None:
                 self.on_trace_complete(trace_id, buffer.get_spans())
         except Exception:
             pass
+
+    def _notify_trace_updated(self, trace_id: str, buffer: SpanBuffer) -> None:
+        """通知已完成的 trace 有新增 span（迟到子 span）。"""
+        try:
+            if self.on_trace_complete is not None:
+                self.on_trace_complete(trace_id, buffer.get_spans())
+        except Exception:
+            pass
+
+    def _completion_check_loop(self) -> None:
+        """定期检查 WAITING_CHILDREN 状态的 trace，空闲超时后触发完成。"""
+        while not self._stop_event.is_set():
+            time.sleep(self.completion_check_interval)
+            self._check_pending_completions()
+
+    def _check_pending_completions(self) -> None:
+        """检查所有 buffer，触发满足空闲条件的完成回调。"""
+        with self._buffers_lock:
+            for trace_id, buffer in list(self._trace_buffers.items()):
+                if trace_id in self._notified_traces:
+                    continue
+                if buffer.can_complete(force_flush=False):
+                    self._notify_trace_complete(trace_id, buffer)
 
     def _cleanup_loop(self) -> None:
         """定期清理过期的 trace 缓冲区。"""
@@ -271,6 +374,37 @@ class SpanCollector:
             "active_traces": active_traces,
             "queue_size": self._queue.qsize(),
         }
+
+    def flush_trace(self, trace_id: str) -> bool:
+        """
+        强制完成指定 trace，立即触发完成回调。
+        用于测试或手动确认链路结束。
+
+        :return: True 表示成功触发完成，False 表示 trace 不存在或已完成
+        """
+        with self._buffers_lock:
+            buffer = self._trace_buffers.get(trace_id)
+            if buffer is None:
+                return False
+            if trace_id in self._notified_traces:
+                return False
+            if buffer.can_complete(force_flush=True):
+                self._notify_trace_complete(trace_id, buffer)
+                return True
+        return False
+
+    def flush_all(self) -> None:
+        """
+        强制刷新队列 + 强制完成所有等待中的 trace。
+        用于关闭前确保所有数据都被处理。
+        """
+        self.flush()
+        time.sleep(self.completion_check_interval * 2)
+        with self._buffers_lock:
+            for trace_id, buffer in list(self._trace_buffers.items()):
+                if trace_id not in self._notified_traces:
+                    if buffer.can_complete(force_flush=True):
+                        self._notify_trace_complete(trace_id, buffer)
 
     def flush(self) -> None:
         """强制刷新队列中的所有 span。"""

@@ -383,14 +383,18 @@ class TestCollector(unittest.TestCase):
 
         buffer = self.collector.get_trace_buffer(trace_id)
         self.assertIsNotNone(buffer)
+        self.assertFalse(buffer.is_structurally_complete())
         self.assertFalse(buffer.is_complete)
         self.assertEqual(buffer.get_missing_span_ids(), {root_span_id})
 
         self.collector.collect(root_span)
         self.collector.flush()
-        time.sleep(0.2)
+        time.sleep(0.1)
 
         buffer = self.collector.get_trace_buffer(trace_id)
+        self.assertTrue(buffer.is_structurally_complete())
+        self.collector.flush_trace(trace_id)
+        time.sleep(0.2)
         self.assertTrue(buffer.is_complete)
 
     def test_in_memory_storage(self):
