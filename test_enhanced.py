@@ -6,10 +6,13 @@ import random
 
 from context_propagation import TraceContext, ContextManager
 from span import Tracer, Span
-from sampler import ProbabilisticSampler, AlwaysOnSampler
+from sampler import ProbabilisticSampler, AlwaysOnSampler, PerOperationSampler, ServiceOperationSampler
 from collector import SpanCollector, SpanBuffer, InMemoryStorage
 from trace_reconstructor import Trace, TraceReconstructor
 from trace_query import TraceQueryService
+import os
+import json
+import tempfile
 
 
 class TestConcurrentSafety(unittest.TestCase):
@@ -489,6 +492,343 @@ class TestDeterministicSampling(unittest.TestCase):
 
         self.assertEqual(len(storage.get_all_trace_ids()), 0)
         collector.stop()
+
+
+class TestAdvancedSearch(unittest.TestCase):
+    """测试增强搜索：时间范围、分页、排序、大数据量下错误链路不漏。"""
+
+    def _build_dataset(self):
+        storage = InMemoryStorage()
+        reconstructor = TraceReconstructor()
+
+        def on_complete(trace_id, spans):
+            storage.save_trace(trace_id, spans)
+            reconstructor.add_spans(spans)
+
+        collector = SpanCollector(
+            post_root_idle_time=0.1,
+            completion_check_interval=0.05,
+            on_trace_complete=on_complete,
+        )
+        tracer_a = Tracer("gateway", collector=collector, sampler=AlwaysOnSampler())
+        tracer_b = Tracer("pay-svc", collector=collector)
+        collector.start()
+
+        trace_ids = []
+        error_ids = []
+        base_time = time.time() - 500
+
+        for i in range(50):
+            t0 = base_time + i * 10
+            with tracer_a.start_active_span(f"http_{i}", start_time=t0) as root:
+                trace_ids.append(root.trace_id)
+                headers = {}
+                tracer_a.inject(root.context, headers)
+                ctx = tracer_b.extract(headers)
+
+                is_error = i % 25 == 24
+                with tracer_b.start_active_span(f"pay_{i}", context=ctx, start_time=t0 + 0.005) as pay:
+                    if is_error:
+                        pay.set_error("boom")
+                        error_ids.append(root.trace_id)
+                    pay.finish(end_time=t0 + 0.01 + (0.1 if is_error else 0.005))
+                root.finish(end_time=t0 + 0.02 + (0.2 if is_error else 0.01))
+
+        collector.flush()
+        for tid in trace_ids:
+            collector.flush_trace(tid)
+        time.sleep(0.5)
+        collector.flush_all()
+        time.sleep(0.3)
+        collector.stop()
+
+        return TraceQueryService(storage, reconstructor), trace_ids, error_ids, base_time
+
+    def test_pagination(self):
+        """测试分页能拿到不同页的结果。"""
+        q, trace_ids, _, _ = self._build_dataset()
+        page1, total = q.search_traces(limit=10, offset=0)
+        page2, _ = q.search_traces(limit=10, offset=10)
+        self.assertEqual(total, 50)
+        self.assertEqual(len(page1), 10)
+        self.assertEqual(len(page2), 10)
+        self.assertNotEqual(page1[0].trace_id, page2[0].trace_id)
+
+    def test_error_traces_always_found(self):
+        """大数据量下 has_error=True 能筛出所有错误 trace，不会漏。"""
+        q, _, error_ids, _ = self._build_dataset()
+        found, total = q.search_traces(has_error=True, limit=1000)
+        found_ids = {t.trace_id for t in found}
+        self.assertEqual(total, len(error_ids))
+        self.assertEqual(found_ids, set(error_ids))
+
+    def test_time_range_filter(self):
+        """测试按时间范围过滤。"""
+        q, trace_ids, error_ids, base_time = self._build_dataset()
+        start = base_time + 100
+        end = base_time + 250
+        found, total = q.search_traces(start_time=start, end_time=end, limit=1000)
+        self.assertTrue(10 <= total <= 20)
+        for t in found:
+            spans = q.storage.get_trace(t.trace_id)
+            t0 = min(s.start_time for s in spans if s.start_time)
+            self.assertGreaterEqual(t0, start)
+            self.assertLessEqual(t0, end)
+
+    def test_min_duration_filter(self):
+        """错误 trace 更慢，按最小耗时应该只筛到错误 trace。"""
+        q, _, error_ids, _ = self._build_dataset()
+        found, total = q.search_traces(min_duration_ms=150, limit=1000)
+        self.assertEqual(total, len(error_ids))
+        self.assertEqual({t.trace_id for t in found}, set(error_ids))
+
+    def test_sort_by_duration_desc(self):
+        """按耗时倒序，最前面应该是错误 trace（它们耗时更长）。"""
+        q, _, error_ids, _ = self._build_dataset()
+        found, _ = q.search_traces(sort=TraceQueryService.SORT_DURATION_DESC, limit=2)
+        for t in found:
+            self.assertIn(t.trace_id, error_ids)
+
+    def test_combined_filters(self):
+        """服务名 + has_error + min_duration 组合过滤。"""
+        q, _, error_ids, _ = self._build_dataset()
+        found, total = q.search_traces(
+            service_name="pay-svc", has_error=True, min_duration_ms=150, limit=1000
+        )
+        self.assertEqual(total, len(error_ids))
+        self.assertEqual({t.trace_id for t in found}, set(error_ids))
+
+
+class TestJsonProcessDedup(unittest.TestCase):
+    """测试 JSON 输出里同一服务只对应一个 process。"""
+
+    def test_single_process_per_service(self):
+        storage = InMemoryStorage()
+        reconstructor = TraceReconstructor()
+
+        def on_complete(trace_id, spans):
+            storage.save_trace(trace_id, spans)
+            reconstructor.add_spans(spans)
+
+        collector = SpanCollector(post_root_idle_time=0.1, on_trace_complete=on_complete)
+        t1 = Tracer("gateway", collector=collector, sampler=AlwaysOnSampler())
+        t2 = Tracer("pay-svc", collector=collector)
+        collector.start()
+
+        with t1.start_active_span("root") as root:
+            headers = {}
+            t1.inject(root.context, headers)
+            ctx = t2.extract(headers)
+            with t2.start_active_span("pay_a", context=ctx):
+                pass
+            with t2.start_active_span("pay_b", context=ctx):
+                pass
+            tid = root.trace_id
+
+        collector.flush()
+        collector.flush_trace(tid)
+        time.sleep(0.5)
+        collector.stop()
+
+        q = TraceQueryService(storage, reconstructor)
+        data = json.loads(q.get_trace_json(tid))
+
+        processes = data["processes"]
+        service_names = [p["serviceName"] for p in processes.values()]
+        self.assertEqual(len(service_names), len(set(service_names)))
+        self.assertIn("gateway", service_names)
+        self.assertIn("pay-svc", service_names)
+
+        pids = [s["processID"] for s in data["spans"] if s["operationName"].startswith("pay_")]
+        self.assertEqual(len(set(pids)), 1, "同一服务的多个 span 应共享同一个 processID")
+
+
+class TestBatchImportExport(unittest.TestCase):
+    """测试批量导入导出。"""
+
+    def _make_data(self):
+        storage = InMemoryStorage()
+        reconstructor = TraceReconstructor()
+
+        def on_complete(trace_id, spans):
+            storage.save_trace(trace_id, spans)
+            reconstructor.add_spans(spans)
+
+        collector = SpanCollector(post_root_idle_time=0.1, on_trace_complete=on_complete)
+        t1 = Tracer("svc-a", collector=collector, sampler=AlwaysOnSampler())
+        t2 = Tracer("svc-b", collector=collector)
+        collector.start()
+
+        tids = []
+        for i in range(3):
+            with t1.start_active_span(f"a_{i}") as root:
+                tids.append(root.trace_id)
+                headers = {}
+                t1.inject(root.context, headers)
+                ctx = t2.extract(headers)
+                with t2.start_active_span(f"b_{i}", context=ctx) as b:
+                    if i == 0:
+                        b.set_error("x")
+
+        collector.flush()
+        for tid in tids:
+            collector.flush_trace(tid)
+        time.sleep(0.5)
+        collector.stop()
+
+        return TraceQueryService(storage, reconstructor), tids
+
+    def test_export_spans_and_import_back(self):
+        """导出原始 span JSON，清空后再导入，数据一致。"""
+        q, tids = self._make_data()
+
+        with tempfile.NamedTemporaryFile("w", suffix=".json", delete=False, encoding="utf-8") as f:
+            path = f.name
+
+        try:
+            q.export_spans_to_json(trace_ids=tids, file_path=path)
+
+            storage2 = InMemoryStorage()
+            rec2 = TraceReconstructor()
+            q2 = TraceQueryService(storage2, rec2)
+            span_count, trace_count = q2.import_spans_from_json(path)
+
+            self.assertEqual(trace_count, 3)
+            self.assertGreater(span_count, 0)
+
+            for tid in tids:
+                orig = json.loads(q.get_trace_json(tid))
+                new = json.loads(q2.get_trace_json(tid))
+                self.assertEqual(orig["traceID"], new["traceID"])
+                self.assertEqual(len(orig["spans"]), len(new["spans"]))
+        finally:
+            os.unlink(path)
+
+    def test_export_single_trace(self):
+        q, tids = self._make_data()
+        js = q.export_trace_to_json(tids[0])
+        self.assertIsNotNone(js)
+        data = json.loads(js)
+        self.assertIn("traceID", data)
+        self.assertIn("spans", data)
+        self.assertIn("processes", data)
+
+    def test_import_array_format(self):
+        """直接 span 数组格式也能导入。"""
+        q, tids = self._make_data()
+
+        with tempfile.NamedTemporaryFile("w", suffix=".json", delete=False, encoding="utf-8") as f:
+            spans_data = []
+            for tid in tids:
+                for s in q.storage.get_trace(tid):
+                    spans_data.append(s.to_dict())
+            json.dump(spans_data, f)
+            path = f.name
+
+        try:
+            storage2 = InMemoryStorage()
+            rec2 = TraceReconstructor()
+            q2 = TraceQueryService(storage2, rec2)
+            n_spans, n_traces = q2.import_spans_from_json(path)
+            self.assertEqual(n_traces, 3)
+            self.assertEqual(n_spans, len(spans_data))
+        finally:
+            os.unlink(path)
+
+
+class TestServiceOperationSampler(unittest.TestCase):
+    """测试按服务/操作粒度的采样配置。"""
+
+    def test_different_rate_per_service_operation(self):
+        sampler = ServiceOperationSampler(
+            service_operation_rates={
+                ("gateway", "pay"): 1.0,
+                ("gateway", "health"): 0.0,
+            },
+            default_rate=0.0,
+        )
+        tracer = Tracer("gateway", sampler=sampler)
+
+        sampled_pay = 0
+        sampled_health = 0
+        for _ in range(50):
+            with tracer.start_active_span("pay") as s:
+                if s.context.sampled:
+                    sampled_pay += 1
+            with tracer.start_active_span("health") as s:
+                if s.context.sampled:
+                    sampled_health += 1
+
+        self.assertEqual(sampled_pay, 50)
+        self.assertEqual(sampled_health, 0)
+
+    def test_service_default_rate(self):
+        sampler = ServiceOperationSampler(
+            service_default_rates={"gateway": 1.0, "other": 0.0},
+            default_rate=0.0,
+        )
+        t1 = Tracer("gateway", sampler=sampler)
+        t2 = Tracer("other", sampler=sampler)
+
+        for _ in range(20):
+            with t1.start_active_span("x") as s:
+                self.assertTrue(s.context.sampled)
+            with t2.start_active_span("y") as s:
+                self.assertFalse(s.context.sampled)
+
+    def test_deterministic_same_trace_id(self):
+        sampler = ServiceOperationSampler(
+            service_operation_rates={("g", "op"): 0.5},
+            default_rate=0.5,
+        )
+        trace_id = TraceContext.generate_trace_id()
+        results = [
+            sampler.should_sample_by_trace_id(trace_id, operation_name="op", service_name="g")
+            for _ in range(50)
+        ]
+        self.assertEqual(len(set(results)), 1)
+
+    def test_downstream_only_inherits(self):
+        """下游服务不重新采样，直接继承入口结果。"""
+        sampler = ServiceOperationSampler(
+            service_operation_rates={
+                ("entry", "all_on"): 1.0,
+                ("entry", "all_off"): 0.0,
+                ("downstream", "all_on"): 0.0,
+            },
+            default_rate=0.0,
+        )
+        entry = Tracer("entry", sampler=sampler)
+        downstream = Tracer("downstream", sampler=sampler)
+
+        all_ok = True
+        for _ in range(30):
+            with entry.start_active_span("all_on") as root:
+                self.assertTrue(root.context.sampled)
+                headers = {}
+                entry.inject(root.context, headers)
+                ctx = downstream.extract(headers)
+                with downstream.start_active_span("child", context=ctx) as c:
+                    if not c.context.sampled:
+                        all_ok = False
+            with entry.start_active_span("all_off") as root:
+                self.assertFalse(root.context.sampled)
+                headers = {}
+                entry.inject(root.context, headers)
+                ctx = downstream.extract(headers)
+                with downstream.start_active_span("child", context=ctx) as c:
+                    if c.context.sampled:
+                        all_ok = False
+
+        self.assertTrue(all_ok, "下游服务应直接继承入口的采样结果，不重新判断")
+
+    def test_per_operation_sampler_with_trace_id(self):
+        sampler = PerOperationSampler({"pay": 1.0, "health": 0.0}, default_rate=0.0)
+        tracer = Tracer("svc", sampler=sampler)
+        with tracer.start_active_span("pay") as s:
+            self.assertTrue(s.context.sampled)
+        with tracer.start_active_span("health") as s:
+            self.assertFalse(s.context.sampled)
 
 
 if __name__ == "__main__":

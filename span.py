@@ -188,9 +188,16 @@ class Tracer:
                 sampled = True
                 if self.sampler is not None:
                     if hasattr(self.sampler, "should_sample_by_trace_id"):
-                        sampled = self.sampler.should_sample_by_trace_id(trace_id)
+                        sampled = self.sampler.should_sample_by_trace_id(
+                            trace_id,
+                            operation_name=operation_name,
+                            service_name=self.service_name,
+                        )
                     else:
-                        sampled = self.sampler.should_sample()
+                        sampled = self.sampler.should_sample(
+                            operation_name=operation_name,
+                            tags={"service_name": self.service_name},
+                        )
                 span_id = TraceContext.generate_span_id()
                 context = TraceContext(
                     trace_id=trace_id,

@@ -462,22 +462,48 @@ class InMemoryStorage:
         self,
         service_name: Optional[str] = None,
         operation_name: Optional[str] = None,
-        limit: int = 100,
+        start_time: Optional[float] = None,
+        end_time: Optional[float] = None,
+        limit: Optional[int] = None,
     ) -> List[str]:
-        """按条件搜索 trace。"""
+        """
+        按条件搜索 trace（不做过早截断，保证大数据量下不会漏掉符合条件的 trace）。
+
+        :param service_name: 任意 span 包含该服务即匹配
+        :param operation_name: 任意 span 包含该操作即匹配
+        :param start_time: trace 起始时间下限（秒，Unix 时间戳）
+        :param end_time: trace 起始时间上限（秒，Unix 时间戳）
+        :param limit: 返回数量上限，None 表示不限制
+        """
         results = []
         with self._lock:
             for trace_id, spans in self._traces.items():
+                if not spans:
+                    continue
                 match = True
                 if service_name is not None:
                     match = any(s.service_name == service_name for s in spans)
                 if match and operation_name is not None:
                     match = any(s.operation_name == operation_name for s in spans)
+                if match and (start_time is not None or end_time is not None):
+                    trace_start = min(s.start_time for s in spans if s.start_time is not None)
+                    if start_time is not None and trace_start < start_time:
+                        match = False
+                    if end_time is not None and trace_start > end_time:
+                        match = False
                 if match:
                     results.append(trace_id)
-                    if len(results) >= limit:
+                    if limit is not None and len(results) >= limit:
                         break
         return results
+
+    def get_trace_start_time(self, trace_id: str) -> Optional[float]:
+        """获取 trace 的最早 span 开始时间（用于排序）。"""
+        spans = self.get_trace(trace_id)
+        if not spans:
+            return None
+        starts = [s.start_time for s in spans if s.start_time is not None]
+        return min(starts) if starts else None
 
     def clear(self) -> None:
         """清空所有数据。"""

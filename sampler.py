@@ -1,7 +1,7 @@
 import random
 import time
 from abc import ABC, abstractmethod
-from typing import Optional, Dict, Any
+from typing import Optional, Dict, Any, Tuple
 
 
 class Sampler(ABC):
@@ -144,10 +144,6 @@ class PerOperationSampler(Sampler):
         operation_sample_rates: Dict[str, float],
         default_rate: float = 0.001,
     ):
-        """
-        :param operation_sample_rates: 操作名称到采样率的映射
-        :param default_rate: 默认采样率，用于未在映射中的操作
-        """
         self.operation_sample_rates = operation_sample_rates
         self.default_rate = default_rate
         self._samplers: Dict[str, ProbabilisticSampler] = {}
@@ -156,9 +152,19 @@ class PerOperationSampler(Sampler):
         for op, rate in operation_sample_rates.items():
             self._samplers[op] = ProbabilisticSampler(rate)
 
+    def _pick_sampler(self, operation_name: str = "") -> ProbabilisticSampler:
+        return self._samplers.get(operation_name, self._default_sampler)
+
     def should_sample(self, operation_name: str = "", tags: Optional[Dict[str, Any]] = None) -> bool:
-        sampler = self._samplers.get(operation_name, self._default_sampler)
-        return sampler.should_sample(operation_name, tags)
+        return self._pick_sampler(operation_name).should_sample(operation_name, tags)
+
+    def should_sample_by_trace_id(
+        self,
+        trace_id: str,
+        operation_name: str = "",
+        service_name: str = "",
+    ) -> bool:
+        return self._pick_sampler(operation_name).should_sample_by_trace_id(trace_id)
 
     def get_description(self) -> str:
         rates = ", ".join(f"{k}={v}" for k, v in self.operation_sample_rates.items())
@@ -166,6 +172,83 @@ class PerOperationSampler(Sampler):
             f"PerOperationSampler(operation_rates={{{rates}}}, "
             f"default_rate={self.default_rate})"
         )
+
+
+class ServiceOperationSampler(Sampler):
+    """
+    按 (服务名, 操作名) 粒度配置不同采样率的确定性采样器。
+
+    - 入口服务使用：先根据 service_name + operation_name 找到对应采样率，
+      再基于 trace_id 哈希做确定性判断（同 trace_id 永远一致）。
+    - 下游服务不使用本类，直接继承上下文的 sampled 标志。
+
+    配置示例：
+        {
+            ("gateway", "/health"): 0.01,
+            ("gateway", "/checkout"): 1.0,
+            ("order-svc", "create_order"): 1.0,
+        }
+        default_rate=0.1  # 其他走默认
+    """
+
+    def __init__(
+        self,
+        service_operation_rates: Optional[Dict[Tuple[str, str], float]] = None,
+        service_default_rates: Optional[Dict[str, float]] = None,
+        default_rate: float = 0.001,
+    ):
+        self.service_operation_rates = dict(service_operation_rates or {})
+        self.service_default_rates = dict(service_default_rates or {})
+        self.default_rate = default_rate
+        self._samplers: Dict[Any, ProbabilisticSampler] = {}
+        self._default_sampler = ProbabilisticSampler(default_rate)
+
+        for (svc, op), rate in self.service_operation_rates.items():
+            self._samplers[(svc, op)] = ProbabilisticSampler(rate)
+        for svc, rate in self.service_default_rates.items():
+            self._samplers[(svc, None)] = ProbabilisticSampler(rate)
+
+    def _pick_sampler(
+        self, service_name: str = "", operation_name: str = ""
+    ) -> ProbabilisticSampler:
+        key = (service_name or "", operation_name or "")
+        if key in self._samplers:
+            return self._samplers[key]
+        svc_key = (service_name or "", None)
+        if svc_key in self._samplers:
+            return self._samplers[svc_key]
+        return self._default_sampler
+
+    def should_sample(self, operation_name: str = "", tags: Optional[Dict[str, Any]] = None) -> bool:
+        service_name = ""
+        if tags:
+            service_name = str(tags.get("service_name", ""))
+        return self._pick_sampler(service_name, operation_name).should_sample()
+
+    def should_sample_by_trace_id(
+        self,
+        trace_id: str,
+        operation_name: str = "",
+        service_name: str = "",
+    ) -> bool:
+        """
+        基于 (service, operation) 对应采样率 + trace_id 哈希做确定性判断。
+        同一个 trace_id + 同配置下结果永远一致。
+        """
+        return self._pick_sampler(service_name, operation_name).should_sample_by_trace_id(trace_id)
+
+    def get_description(self) -> str:
+        parts = []
+        if self.service_operation_rates:
+            rates = ", ".join(
+                f"({s},{o})={r}" for (s, o), r in self.service_operation_rates.items()
+            )
+            parts.append(f"service_op_rates={{{rates}}}")
+        if self.service_default_rates:
+            rates = ", ".join(f"{s}={r}" for s, r in self.service_default_rates.items())
+            parts.append(f"service_defaults={{{rates}}}")
+        parts.append(f"default_rate={self.default_rate}")
+        return f"ServiceOperationSampler({', '.join(parts)})"
 
 
 class AdaptiveSampler(Sampler):
